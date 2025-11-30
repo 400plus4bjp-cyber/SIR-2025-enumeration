@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Home, Database, Wifi, WifiOff, Save, Plus, Trash2 } from 'lucide-react';
+import { Users, Home, Database, Wifi, WifiOff, Save, Plus, Trash2, Download, Settings } from 'lucide-react';
 
 const EnumerationApp = () => {
-  const [projectName] = useState('COMMUNITY ENUMERATION PROJECT 2024');
+  const [projectName] = useState('COMMUNITY ENUMERATION PROJECT 2025');
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [currentFamily, setCurrentFamily] = useState([]);
   const [familyHead, setFamilyHead] = useState('');
   const [totalFamilies, setTotalFamilies] = useState(0);
   const [totalPersons, setTotalPersons] = useState(0);
   const [syncStatus, setSyncStatus] = useState('synced');
+  const [db, setDb] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [googleSheetUrl, setGoogleSheetUrl] = useState(localStorage.getItem('googleSheetUrl') || '');
+  const [enumeratorName, setEnumeratorName] = useState(localStorage.getItem('enumeratorName') || '');
   
   const [formData, setFormData] = useState({
     newDoorNo: '',
@@ -26,16 +30,16 @@ const EnumerationApp = () => {
   });
 
   useEffect(() => {
+    initDB();
+    
     const handleOnline = () => {
       setIsOnline(true);
-      syncData();
+      syncToGoogleSheets();
     };
     const handleOffline = () => setIsOnline(false);
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-
-    loadStats();
     
     return () => {
       window.removeEventListener('online', handleOnline);
@@ -43,28 +47,53 @@ const EnumerationApp = () => {
     };
   }, []);
 
-  const loadStats = async () => {
-    try {
-      const familiesData = await window.storage.list('family:', false);
-      const families = familiesData ? familiesData.keys : [];
-      setTotalFamilies(families.length);
-
-      let personCount = 0;
-      for (const familyKey of families) {
-        try {
-          const familyResult = await window.storage.get(familyKey, false);
-          if (familyResult && familyResult.value) {
-            const family = JSON.parse(familyResult.value);
-            personCount += family.members ? family.members.length : 0;
-          }
-        } catch (err) {
-          console.log('Skipping family:', familyKey);
-        }
-      }
-      setTotalPersons(personCount);
-    } catch (error) {
-      console.error('Error loading stats:', error);
+  useEffect(() => {
+    if (db) {
+      loadStats();
     }
+  }, [db]);
+
+  const initDB = () => {
+    const request = indexedDB.open('EnumerationDB', 1);
+    
+    request.onerror = () => {
+      console.error('Database failed to open');
+      alert('Failed to initialize database. Please refresh the page.');
+    };
+    
+    request.onsuccess = () => {
+      const database = request.result;
+      setDb(database);
+    };
+    
+    request.onupgradeneeded = (e) => {
+      const database = e.target.result;
+      
+      if (!database.objectStoreNames.contains('families')) {
+        const objectStore = database.createObjectStore('families', { keyPath: 'id' });
+        objectStore.createIndex('doorNo', 'doorNo', { unique: false });
+        objectStore.createIndex('synced', 'synced', { unique: false });
+      }
+    };
+  };
+
+  const loadStats = () => {
+    if (!db) return;
+    
+    const transaction = db.transaction(['families'], 'readonly');
+    const objectStore = transaction.objectStore('families');
+    const request = objectStore.getAll();
+    
+    request.onsuccess = () => {
+      const families = request.result;
+      setTotalFamilies(families.length);
+      
+      let personCount = 0;
+      families.forEach(family => {
+        personCount += family.members ? family.members.length : 0;
+      });
+      setTotalPersons(personCount);
+    };
   };
 
   const handleInputChange = (field, value) => {
@@ -116,9 +145,7 @@ const EnumerationApp = () => {
     const month = formData.dobMonth;
     const year = formData.dobYear;
     if (day && month && year) {
-      const paddedDay = day.padStart(2, '0');
-      const paddedMonth = month.padStart(2, '0');
-      return paddedDay + '/' + paddedMonth + '/' + year;
+      return day.padStart(2, '0') + '/' + month.padStart(2, '0') + '/' + year;
     }
     return '';
   };
@@ -171,29 +198,34 @@ const EnumerationApp = () => {
     setCurrentFamily(prev => prev.filter(m => m.id !== id));
   };
 
-  const saveFamily = async () => {
+  const saveFamily = () => {
     if (currentFamily.length === 0) {
       alert('Add at least one family member before saving');
       return;
     }
 
-    try {
-      const familyId = 'family:' + Date.now();
-      const familyData = {
-        id: familyId,
-        doorNo: currentFamily[0].newDoorNo,
-        familyHead: familyHead,
-        members: currentFamily,
-        createdAt: new Date().toISOString(),
-        synced: false
-      };
+    if (!db) {
+      alert('Database not ready. Please wait a moment and try again.');
+      return;
+    }
 
-      await window.storage.set(familyId, JSON.stringify(familyData), false);
-      
-      await window.storage.set('sync:pending', 'true', false);
-      setSyncStatus('pending');
+    const familyId = 'family_' + Date.now();
+    const familyData = {
+      id: familyId,
+      doorNo: currentFamily[0].newDoorNo,
+      familyHead: familyHead,
+      members: currentFamily,
+      createdAt: new Date().toISOString(),
+      enumerator: enumeratorName || 'Unknown',
+      synced: false
+    };
 
-      alert('Family saved successfully! ' + currentFamily.length + ' member(s) registered.');
+    const transaction = db.transaction(['families'], 'readwrite');
+    const objectStore = transaction.objectStore('families');
+    const request = objectStore.add(familyData);
+    
+    request.onsuccess = () => {
+      alert('Family saved! ' + currentFamily.length + ' member(s) registered locally.');
       
       setCurrentFamily([]);
       setFamilyHead('');
@@ -213,53 +245,139 @@ const EnumerationApp = () => {
       });
 
       loadStats();
+      setSyncStatus('pending');
       
-      if (isOnline) {
-        syncData();
+      if (isOnline && googleSheetUrl) {
+        syncToGoogleSheets();
       }
-    } catch (error) {
-      console.error('Error saving family:', error);
+    };
+    
+    request.onerror = () => {
       alert('Error saving family. Please try again.');
+    };
+  };
+
+  const syncToGoogleSheets = async () => {
+    if (!isOnline || !db || !googleSheetUrl) {
+      return;
+    }
+
+    setSyncStatus('syncing');
+    
+    const transaction = db.transaction(['families'], 'readonly');
+    const objectStore = transaction.objectStore('families');
+    const request = objectStore.getAll();
+    
+    request.onsuccess = async () => {
+      const families = request.result;
+      const unsyncedFamilies = families.filter(f => !f.synced);
+      
+      if (unsyncedFamilies.length === 0) {
+        setSyncStatus('synced');
+        return;
+      }
+
+      const rows = [];
+      unsyncedFamilies.forEach(family => {
+        family.members.forEach(member => {
+          rows.push({
+            familyId: family.id,
+            doorNo: member.newDoorNo || '',
+            oldDoorNo: member.oldDoorNo || '',
+            portionNo: member.portionNo || '',
+            familyHead: family.familyHead,
+            memberName: member.name,
+            relationship: member.relationship || '',
+            relativeName: member.relativeName || '',
+            gender: member.gender || '',
+            age: member.age || '',
+            dob: member.dob || '',
+            voterId: member.voterId || '',
+            enumerator: family.enumerator || '',
+            createdAt: family.createdAt
+          });
+        });
+      });
+
+      try {
+        await fetch(googleSheetUrl, {
+          method: 'POST',
+          mode: 'no-cors',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ rows: rows })
+        });
+
+        const updateTransaction = db.transaction(['families'], 'readwrite');
+        const updateStore = updateTransaction.objectStore('families');
+        
+        unsyncedFamilies.forEach(family => {
+          family.synced = true;
+          updateStore.put(family);
+        });
+        
+        setSyncStatus('synced');
+      } catch (error) {
+        setSyncStatus('pending');
+      }
+    };
+  };
+
+  const saveSettings = () => {
+    localStorage.setItem('googleSheetUrl', googleSheetUrl);
+    localStorage.setItem('enumeratorName', enumeratorName);
+    setShowSettings(false);
+    alert('Settings saved!');
+    if (isOnline && googleSheetUrl) {
+      syncToGoogleSheets();
     }
   };
 
-  const syncData = async () => {
-    if (!isOnline) return;
-
-    try {
-      setSyncStatus('syncing');
+  const exportData = () => {
+    if (!db) return;
+    
+    const transaction = db.transaction(['families'], 'readonly');
+    const objectStore = transaction.objectStore('families');
+    const request = objectStore.getAll();
+    
+    request.onsuccess = () => {
+      const families = request.result;
+      const csvRows = [];
       
-      const familiesData = await window.storage.list('family:', false);
-      const families = familiesData ? familiesData.keys : [];
-
-      for (const familyKey of families) {
-        try {
-          const familyResult = await window.storage.get(familyKey, false);
-          if (familyResult && familyResult.value) {
-            const family = JSON.parse(familyResult.value);
-            
-            if (!family.synced) {
-              const syncedFamily = {...family, synced: true};
-              await window.storage.set(familyKey, JSON.stringify(syncedFamily), true);
-              await window.storage.set(familyKey, JSON.stringify(syncedFamily), false);
-            }
-          }
-        } catch (err) {
-          console.log('Sync error for family:', familyKey, err);
-        }
-      }
-
-      try {
-        await window.storage.delete('sync:pending', false);
-      } catch (err) {
-        console.log('No pending sync flag');
-      }
-      setSyncStatus('synced');
-      loadStats();
-    } catch (error) {
-      console.error('Sync error:', error);
-      setSyncStatus('error');
-    }
+      csvRows.push('Family ID,Door No,Old Door,Portion,Family Head,Name,Relation,Relative,Gender,Age,DOB,Voter ID,Enumerator,Date');
+      
+      families.forEach(family => {
+        family.members.forEach(member => {
+          const row = [
+            family.id,
+            member.newDoorNo || '',
+            member.oldDoorNo || '',
+            member.portionNo || '',
+            family.familyHead,
+            member.name,
+            member.relationship || '',
+            member.relativeName || '',
+            member.gender || '',
+            member.age || '',
+            member.dob || '',
+            member.voterId || '',
+            family.enumerator || '',
+            family.createdAt
+          ];
+          csvRows.push(row.map(f => '"' + f + '"').join(','));
+        });
+      });
+      
+      const csvContent = csvRows.join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'enumeration_' + new Date().toISOString().split('T')[0] + '.csv';
+      a.click();
+      window.URL.revokeObjectURL(url);
+    };
   };
 
   return (
@@ -269,42 +387,92 @@ const EnumerationApp = () => {
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
               <Home className="w-8 h-8" />
-              <h1 className="text-2xl font-bold">{projectName}</h1>
+              <h1 className="text-xl font-bold">{projectName}</h1>
             </div>
-            {isOnline ? (
-              <Wifi className="w-6 h-6 text-green-300" />
-            ) : (
-              <WifiOff className="w-6 h-6 text-red-300" />
-            )}
+            <div className="flex items-center gap-2">
+              {isOnline ? <Wifi className="w-5 h-5 text-green-300" /> : <WifiOff className="w-5 h-5 text-red-300" />}
+              <button onClick={exportData} className="p-2 bg-indigo-600 rounded-lg hover:bg-indigo-500" title="Export CSV">
+                <Download className="w-5 h-5" />
+              </button>
+              <button onClick={() => setShowSettings(true)} className="p-2 bg-indigo-600 rounded-lg hover:bg-indigo-500" title="Settings">
+                <Settings className="w-5 h-5" />
+              </button>
+            </div>
           </div>
-          <p className="text-indigo-200 text-sm">Door-to-Door Family Enumeration</p>
+          <p className="text-indigo-200 text-sm">Door-to-Door Enumeration</p>
+          {enumeratorName && <p className="text-indigo-300 text-xs mt-1">By: {enumeratorName}</p>}
         </div>
+
+        {showSettings && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl p-6 max-w-md w-full max-h-screen overflow-y-auto">
+              <h2 className="text-xl font-bold mb-4">⚙️ Settings</h2>
+              
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-bold mb-2">Your Name</label>
+                  <input
+                    type="text"
+                    value={enumeratorName}
+                    onChange={(e) => setEnumeratorName(e.target.value.toUpperCase())}
+                    className="w-full px-3 py-2 border-2 rounded-lg uppercase"
+                    placeholder="YOUR NAME"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-bold mb-2">Google Script URL</label>
+                  <input
+                    type="url"
+                    value={googleSheetUrl}
+                    onChange={(e) => setGoogleSheetUrl(e.target.value)}
+                    className="w-full px-3 py-2 border-2 rounded-lg text-sm"
+                    placeholder="https://script.google.com/..."
+                  />
+                  <p className="text-xs text-gray-600 mt-1">Paste Web App URL from Google</p>
+                </div>
+
+                <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-3">
+                  <p className="text-xs"><strong>ℹ️ Note:</strong> Data saves locally even without Google Sheets. Sync is optional for team sharing.</p>
+                </div>
+              </div>
+
+              <div className="flex gap-3 mt-6">
+                <button onClick={saveSettings} className="flex-1 bg-indigo-600 text-white py-2 rounded-lg font-bold">
+                  Save
+                </button>
+                <button onClick={() => setShowSettings(false)} className="flex-1 bg-gray-200 py-2 rounded-lg font-bold">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="bg-white p-4 shadow-md grid grid-cols-3 gap-4">
           <div className="text-center">
             <div className="flex items-center justify-center gap-2 text-indigo-600 mb-1">
               <Home className="w-5 h-5" />
-              <span className="text-sm font-semibold">Families</span>
+              <span className="text-sm font-bold">Families</span>
             </div>
             <div className="text-3xl font-bold text-indigo-700">{totalFamilies}</div>
           </div>
           <div className="text-center">
             <div className="flex items-center justify-center gap-2 text-green-600 mb-1">
               <Users className="w-5 h-5" />
-              <span className="text-sm font-semibold">Persons</span>
+              <span className="text-sm font-bold">Persons</span>
             </div>
             <div className="text-3xl font-bold text-green-700">{totalPersons}</div>
           </div>
           <div className="text-center">
             <div className="flex items-center justify-center gap-2 text-purple-600 mb-1">
               <Database className="w-5 h-5" />
-              <span className="text-sm font-semibold">Status</span>
+              <span className="text-sm font-bold">Sync</span>
             </div>
-            <div className={'text-xs font-semibold mt-2 px-2 py-1 rounded ' + (
+            <div className={'text-xs font-bold mt-2 px-2 py-1 rounded ' + (
               syncStatus === 'synced' ? 'bg-green-100 text-green-700' :
               syncStatus === 'syncing' ? 'bg-blue-100 text-blue-700' :
-              syncStatus === 'pending' ? 'bg-yellow-100 text-yellow-700' :
-              'bg-red-100 text-red-700'
+              'bg-yellow-100 text-yellow-700'
             )}>
               {syncStatus.toUpperCase()}
             </div>
@@ -312,65 +480,65 @@ const EnumerationApp = () => {
         </div>
 
         <div className="bg-white rounded-b-xl shadow-lg p-6 mb-4">
-          <h2 className="text-xl font-bold text-gray-800 mb-4">
-            {currentFamily.length === 0 ? 'Register Family Head' : 'Add Family Member (' + (currentFamily.length + 1) + ')'}
+          <h2 className="text-xl font-bold mb-4">
+            {currentFamily.length === 0 ? '👤 Register Family Head' : '➕ Add Member (' + (currentFamily.length + 1) + ')'}
           </h2>
 
           <div className="space-y-4">
             <div className="grid grid-cols-3 gap-3">
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">New Door No</label>
+                <label className="block text-sm font-bold mb-1">New Door</label>
                 <input
                   type="number"
                   inputMode="numeric"
                   value={formData.newDoorNo}
                   onChange={(e) => handleInputChange('newDoorNo', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                   disabled={currentFamily.length > 0}
                 />
               </div>
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Old Door No</label>
+                <label className="block text-sm font-bold mb-1">Old Door</label>
                 <input
                   type="number"
                   inputMode="numeric"
                   value={formData.oldDoorNo}
                   onChange={(e) => handleInputChange('oldDoorNo', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                   disabled={currentFamily.length > 0}
                 />
               </div>
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Portion No</label>
+                <label className="block text-sm font-bold mb-1">Portion</label>
                 <input
                   type="number"
                   inputMode="numeric"
                   value={formData.portionNo}
                   onChange={(e) => handleInputChange('portionNo', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                   disabled={currentFamily.length > 0}
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-sm font-semibold text-gray-700 mb-1">Name *</label>
+              <label className="block text-sm font-bold mb-1">Name *</label>
               <input
                 type="text"
                 value={formData.name}
                 onChange={(e) => handleInputChange('name', e.target.value)}
-                className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 uppercase"
+                className="w-full px-3 py-2 border-2 rounded-lg uppercase"
                 placeholder="FULL NAME"
               />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Relationship</label>
+                <label className="block text-sm font-bold mb-1">Relationship</label>
                 <select
                   value={formData.relationship}
                   onChange={(e) => handleInputChange('relationship', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                 >
                   <option value="">Select</option>
                   <option value="F">F (Father)</option>
@@ -379,24 +547,24 @@ const EnumerationApp = () => {
                 </select>
               </div>
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Relative Name</label>
+                <label className="block text-sm font-bold mb-1">Relative Name</label>
                 <input
                   type="text"
                   value={formData.relativeName}
                   onChange={(e) => handleInputChange('relativeName', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 uppercase"
-                  placeholder={familyHead || "RELATIVE NAME"}
+                  className="w-full px-3 py-2 border-2 rounded-lg uppercase"
+                  placeholder={familyHead || "NAME"}
                 />
               </div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Gender</label>
+                <label className="block text-sm font-bold mb-1">Gender</label>
                 <select
                   value={formData.gender}
                   onChange={(e) => handleInputChange('gender', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                 >
                   <option value="">Select</option>
                   <option value="M">M (Male)</option>
@@ -405,99 +573,106 @@ const EnumerationApp = () => {
                 </select>
               </div>
               <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-1">Age</label>
+                <label className="block text-sm font-bold mb-1">Age</label>
                 <input
                   type="number"
                   inputMode="numeric"
                   value={formData.age}
                   onChange={(e) => handleInputChange('age', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  className="w-full px-3 py-2 border-2 rounded-lg"
                   placeholder="Age"
                 />
               </div>
             </div>
 
             <div>
-              <label className="block text-sm font-semibold text-gray-700 mb-1">Date of Birth (DD/MM/YYYY)</label>
+              <label className="block text-sm font-bold mb-1">Date of Birth</label>
               <div className="grid grid-cols-3 gap-2">
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  value={formData.dobDay}
-                  onChange={(e) => handleInputChange('dobDay', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-center"
-                  placeholder="DD"
-                  maxLength="2"
-                />
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  value={formData.dobMonth}
-                  onChange={(e) => handleInputChange('dobMonth', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-center"
-                  placeholder="MM"
-                  maxLength="2"
-                />
-                <input
-                  type="number"
-                  inputMode="numeric"
-                  value={formData.dobYear}
-                  onChange={(e) => handleInputChange('dobYear', e.target.value)}
-                  className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 text-center"
-                  placeholder="YYYY"
-                  maxLength="4"
-                />
+                <div>
+                  <input
+                    id="dobDay"
+                    type="tel"
+                    inputMode="numeric"
+                    value={formData.dobDay}
+                    onChange={(e) => handleDOBInput('dobDay', e.target.value, 'dobMonth')}
+                    className="w-full px-3 py-2 border-2 rounded-lg text-center font-bold"
+                    placeholder="DD"
+                    maxLength="2"
+                  />
+                  <p className="text-xs text-center mt-1">2 digits</p>
+                </div>
+                <div>
+                  <input
+                    id="dobMonth"
+                    type="tel"
+                    inputMode="numeric"
+                    value={formData.dobMonth}
+                    onChange={(e) => handleDOBInput('dobMonth', e.target.value, 'dobYear')}
+                    className="w-full px-3 py-2 border-2 rounded-lg text-center font-bold"
+                    placeholder="MM"
+                    maxLength="2"
+                  />
+                  <p className="text-xs text-center mt-1">2 digits</p>
+                </div>
+                <div>
+                  <input
+                    id="dobYear"
+                    type="tel"
+                    inputMode="numeric"
+                    value={formData.dobYear}
+                    onChange={(e) => handleDOBInput('dobYear', e.target.value, null)}
+                    className="w-full px-3 py-2 border-2 rounded-lg text-center font-bold"
+                    placeholder="YYYY"
+                    maxLength="4"
+                  />
+                  <p className="text-xs text-center mt-1">4 digits</p>
+                </div>
               </div>
-              {formatDOB() && (
-                <p className="text-sm text-indigo-600 mt-1">Formatted: {formatDOB()}</p>
-              )}
+              {formatDOB() && <p className="text-sm text-indigo-600 mt-1 font-bold">📅 {formatDOB()}</p>}
             </div>
 
             <div>
-              <label className="block text-sm font-semibold text-gray-700 mb-1">Voter ID</label>
+              <label className="block text-sm font-bold mb-1">Voter ID</label>
               <input
                 type="text"
                 value={formData.voterId}
                 onChange={(e) => handleInputChange('voterId', e.target.value)}
-                className="w-full px-3 py-2 border-2 border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 uppercase"
-                placeholder="VOTER ID NUMBER"
+                className="w-full px-3 py-2 border-2 rounded-lg uppercase"
+                placeholder="VOTER ID"
               />
             </div>
 
             <button
               onClick={addFamilyMember}
-              className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition flex items-center justify-center gap-2 shadow-md"
+              className="w-full bg-indigo-600 text-white py-3 rounded-lg font-bold hover:bg-indigo-700 flex items-center justify-center gap-2"
             >
               <Plus className="w-5 h-5" />
-              {currentFamily.length === 0 ? 'Add Family Head' : 'Add Family Member'}
+              {currentFamily.length === 0 ? 'Add Family Head' : 'Add Member'}
             </button>
           </div>
         </div>
 
         {currentFamily.length > 0 && (
           <div className="bg-white rounded-xl shadow-lg p-6 mb-4">
-            <h3 className="text-lg font-bold text-gray-800 mb-3">
+            <h3 className="text-lg font-bold mb-3">
               Current Family ({currentFamily.length} member{currentFamily.length !== 1 ? 's' : ''})
             </h3>
             <div className="space-y-2 max-h-60 overflow-y-auto">
               {currentFamily.map((member, index) => (
-                <div key={member.id} className="flex items-center justify-between bg-gray-50 p-3 rounded-lg border border-gray-200">
-                  <div className="flex-1">
-                    <div className="font-semibold text-gray-800">
+                <div key={member.id} className="flex justify-between bg-gray-50 p-3 rounded-lg border-2">
+                  <div>
+                    <div className="font-bold">
                       {index === 0 && '👤 '}{member.name}
                       {index === 0 && <span className="text-xs ml-2 text-indigo-600">(HEAD)</span>}
                     </div>
                     <div className="text-sm text-gray-600">
-                      {member.gender && member.gender + ', '}
+                      {member.gender && member.gender + ' | '}
                       {member.age && 'Age: ' + member.age}
-                      {member.voterId && ' | ID: ' + member.voterId}
+                      {member.voterId && ' | ' + member.voterId}
                     </div>
                   </div>
                   {index > 0 && (
-                    <button
-                      onClick={() => removeFamilyMember(member.id)}
-                      className="ml-3 text-red-500 hover:text-red-700"
-                    >
+                    <button onClick={() => removeFamilyMember(member.id)} className="text-red-500">
                       <Trash2 className="w-5 h-5" />
                     </button>
                   )}
@@ -507,17 +682,16 @@ const EnumerationApp = () => {
 
             <button
               onClick={saveFamily}
-              className="w-full mt-4 bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition flex items-center justify-center gap-2 shadow-md"
+              className="w-full mt-4 bg-green-600 text-white py-3 rounded-lg font-bold hover:bg-green-700 flex items-center justify-center gap-2"
             >
               <Save className="w-5 h-5" />
-              Save Complete Family
+              💾 Save Complete Family
             </button>
           </div>
         )}
 
-        <div className="text-center text-sm text-gray-600 mt-4">
-          <p>Data stored securely • Auto-sync when online</p>
-          <p className="text-xs mt-1">Powered by Persistent Storage</p>
+        <div className="text-center text-sm text-gray-600 mt-4 bg-white rounded-lg p-3">
+          <p className="font-bold">✅ Works Offline | 💾 Local Storage | ☁️ Auto-Sync</p>
         </div>
       </div>
     </div>
